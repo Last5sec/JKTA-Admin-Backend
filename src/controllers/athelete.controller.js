@@ -110,47 +110,47 @@ const markStatusApproved = async (req, res) => {
             { new: true }
         );
 
-        await downloadImage(
-            atheleteData.photo,
-            `${atheleteData.regNo}-download.png`
-        );
+        if (!athlete) {
+            return res.status(404).json({ message: "Athlete not found" });
+        }
 
-        await generateCard({
-            id: atheleteData.regNo,
-            enrollmentNo: AthleteEnrollmentDetails.enrollmentNumber,
-            type: "A",
-            name: atheleteData.athleteName,
-            parentage: atheleteData.fatherName,
-            gender: atheleteData.gender,
-            valid: expiryDate(atheleteData.createdAt),
-            district: atheleteData.district,
-            dob: `${atheleteData.dob}`,
-        });
+        // If the licence card was already generated and emailed (e.g. the
+        // public backend now issues it automatically on verified payment),
+        // do not send it a second time on approval.
+        if (atheleteData.licenceEmailStatus === "sent") {
+            return res.status(200).json({
+                message: "Athlete approved successfully. Licence card was already delivered.",
+                athlete,
+                licenceEmailSent: true,
+            });
+        }
 
-        await sendWithAttachment(
-            atheleteData.email,
-            `${AthleteEnrollmentDetails.enrollmentNumber} - Congratulations, your profile has been approved`,
-            `Dear ${atheleteData.athleteName},
+        const validUntil = expiryDate(atheleteData.createdAt);
+        let licenceEmailResult = { sent: false, error: null };
 
-            Congratulations! Your profile has been approved by JKTA. Below are your enrollment details:
+        try {
+            await downloadImage(
+                atheleteData.photo,
+                `${atheleteData.regNo}-download.png`
+            );
 
-            Tracking Number: ${atheleteData.regNo}
-            Enrollment Number/Roll Number: ${AthleteEnrollmentDetails.enrollmentNumber}
-            Date of Expiry: 2022-12-31
-            Name: ${atheleteData.athleteName}
+            await generateCard({
+                id: atheleteData.regNo,
+                enrollmentNo: AthleteEnrollmentDetails.enrollmentNumber,
+                type: "A",
+                name: atheleteData.athleteName,
+                parentage: atheleteData.fatherName,
+                gender: atheleteData.gender,
+                valid: validUntil,
+                district: atheleteData.district,
+                dob: `${atheleteData.dob}`,
+            });
 
-            Please find your Athlete License attached below.
-
-            For any future correspondence, please use this email and the mobile number provided during registration.
-
-            Email: ${atheleteData.email}
-            Mobile: ${atheleteData.mob}
-
-            Thank you for registering with JKTA.
-
-            Best regards,
-            JKTA Team`,
-            `<p>Dear ${atheleteData.athleteName},</p>
+            licenceEmailResult = await sendWithAttachment(
+                atheleteData.email,
+                `${AthleteEnrollmentDetails.enrollmentNumber} - Congratulations, your profile has been approved`,
+                `Dear ${atheleteData.athleteName},\n\n            Congratulations! Your profile has been approved by JKTA. Below are your enrollment details:\n\n            Tracking Number: ${atheleteData.regNo}\n            Enrollment Number/Roll Number: ${AthleteEnrollmentDetails.enrollmentNumber}\n            Date of Expiry: ${validUntil}\n            Name: ${atheleteData.athleteName}\n\n            Please find your Athlete License attached below.\n\n            For any future correspondence, please use this email and the mobile number provided during registration.\n\n            Email: ${atheleteData.email}\n            Mobile: ${atheleteData.mob}\n\n            Thank you for registering with JKTA.\n\n            Best regards,\n            JKTA Team`,
+                `<p>Dear ${atheleteData.athleteName},</p>
             <p>Congratulations! Your profile has been approved by JKTA. Below are your enrollment details:</p>
             <table>
             <tr>
@@ -163,7 +163,7 @@ const markStatusApproved = async (req, res) => {
             </tr>
             <tr>
                 <td><strong>Date of Expiry:</strong></td>
-                <td>2022-12-31</td>
+                <td>${validUntil}</td>
             </tr>
             <tr>
                 <td><strong>Name:</strong></td>
@@ -173,22 +173,55 @@ const markStatusApproved = async (req, res) => {
             <p>Please find your Athlete License attached below.</p>
             <p>For any future correspondence, please use this email and the mobile number provided during registration.</p>
             <p><strong>Email:</strong> ${atheleteData.email}</p>
-            <p><strong>Mobile:</strong> ${atheleteData.mobile}</p>
+            <p><strong>Mobile:</strong> ${atheleteData.mob}</p>
             <p>Thank you for registering with JKTA.</p>
             <p>Best regards,<br>JKTA Team</p>`,
-            `${atheleteData.regNo}-identity-card.pdf`,
-            `./${atheleteData.regNo}-identity-card.pdf`
-        );
-
-        await deleteFiles(atheleteData.regNo);
-
-        if (!athlete) {
-            return res.status(404).json({ message: "Athlete not found" });
+                `${atheleteData.regNo}-identity-card.pdf`,
+                `./${atheleteData.regNo}-identity-card.pdf`
+            );
+        } catch (licenceError) {
+            console.error(
+                "Licence card generation/delivery failed:",
+                licenceError && licenceError.message
+            );
+            licenceEmailResult = {
+                sent: false,
+                error: licenceError && licenceError.message
+                    ? licenceError.message
+                    : "Licence card generation failed",
+            };
+        } finally {
+            // Best-effort temp cleanup; a retry regenerates the card.
+            try {
+                await deleteFiles(atheleteData.regNo);
+            } catch (_) {
+                /* ignore cleanup errors */
+            }
         }
 
-        res.status(200).json({
-            message: "Athlete approved successfully.",
+        // Persist the real delivery outcome so failures are visible and
+        // retryable (the payment/registration is never lost).
+        await Athelete.findByIdAndUpdate(atheleteData._id, {
+            $set: {
+                enrollmentNumber: AthleteEnrollmentDetails.enrollmentNumber,
+                licenceEmailStatus: licenceEmailResult.sent ? "sent" : "failed",
+                licenceEmailMessageId: licenceEmailResult.messageId || null,
+                licenceEmailError: licenceEmailResult.sent
+                    ? null
+                    : licenceEmailResult.error || "Unknown error",
+                licenceEmailAttempts: (atheleteData.licenceEmailAttempts || 0) + 1,
+                licenceEmailLastAttemptAt: new Date(),
+                ...(licenceEmailResult.sent ? { licenceIssuedAt: new Date() } : {}),
+                licenceProcessingAt: null,
+            },
+        });
+
+        return res.status(200).json({
+            message: licenceEmailResult.sent
+                ? "Athlete approved successfully. Licence card emailed."
+                : "Athlete approved, but the licence card email failed. The failure was recorded and can be retried.",
             athlete,
+            licenceEmailSent: licenceEmailResult.sent,
         });
     } catch (error) {
         res.status(500).json({ message: "Internal server error" });

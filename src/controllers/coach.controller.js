@@ -109,45 +109,44 @@ const markStatusApproved = async (req, res) => {
             { new: true }
         );
 
-        await downloadImage(coachData.photo, `${coachData.regNo}-download.png`);
+        if (!coach) {
+            return res.status(404).json({ message: "Coach not found" });
+        }
 
-        await generateCard({
-            id: coachData.regNo,
-            enrollmentNo: CoachEnrollmentDetails.enrollmentNumber,
-            type: "C",
-            name: coachData.playerName,
-            parentage: coachData.fatherName,
-            gender: coachData.gender,
-            valid: expiryDate(coachData.createdAt),
-            district: coachData.district,
-            dob: `${coachData.dob}`,
-        });
+        // Skip re-sending when the card was already delivered (e.g. the
+        // public backend issues it automatically on verified payment).
+        if (coachData.licenceEmailStatus === "sent") {
+            return res.status(200).json({
+                message: "Coach approved successfully. Licence card was already delivered.",
+                coach,
+                licenceEmailSent: true,
+            });
+        }
 
-        await sendWithAttachment(
-            coachData.email,
-            `${CoachEnrollmentDetails.enrollmentNumber} - Congratulations, your profile has been approved`,
-            `Dear ${coachData.playerName},
+        const validUntil = expiryDate(coachData.createdAt);
+        let licenceEmailResult = { sent: false, error: null };
 
-            Congratulations! Your profile has been approved by JKTC. Below are your enrollment details:
+        try {
+            await downloadImage(coachData.photo, `${coachData.regNo}-download.png`);
 
-            Tracking Number: ${coachData.regNo}
-            Enrollment Number/Roll Number: ${CoachEnrollmentDetails.enrollmentNumber}
-            Date of Expiry: 2022-12-31
-            Name: ${coachData.playerName}
+            await generateCard({
+                id: coachData.regNo,
+                enrollmentNo: CoachEnrollmentDetails.enrollmentNumber,
+                type: "C",
+                name: coachData.playerName,
+                parentage: coachData.fatherName,
+                gender: coachData.gender,
+                valid: validUntil,
+                district: coachData.district,
+                dob: `${coachData.dob}`,
+            });
 
-            Please find your Coach License attached below.
-
-            For any future correspondence, please use this email and the mobile number provided during registration.
-
-            Email: ${process.env.ADMIN_EMAIL}
-            Mobile: ${process.env.ADMIN_MOBILE}
-
-            Thank you for registering with JKTC.
-
-            Best regards,
-            JKTC Team`,
-            `<p>Dear ${coachData.playerName},</p>
-            <p>Congratulations! Your profile has been approved by JKTC. Below are your enrollment details:</p>
+            licenceEmailResult = await sendWithAttachment(
+                coachData.email,
+                `${CoachEnrollmentDetails.enrollmentNumber} - Congratulations, your profile has been approved`,
+                `Dear ${coachData.playerName},\n\n            Congratulations! Your profile has been approved by JKTA. Below are your enrollment details:\n\n            Tracking Number: ${coachData.regNo}\n            Enrollment Number/Roll Number: ${CoachEnrollmentDetails.enrollmentNumber}\n            Date of Expiry: ${validUntil}\n            Name: ${coachData.playerName}\n\n            Please find your Coach License attached below.\n\n            For any future correspondence, please use this email and the mobile number provided during registration.\n\n            Email: ${process.env.ADMIN_EMAIL}\n            Mobile: ${process.env.ADMIN_MOBILE}\n\n            Thank you for registering with JKTA.\n\n            Best regards,\n            JKTA Team`,
+                `<p>Dear ${coachData.playerName},</p>
+            <p>Congratulations! Your profile has been approved by JKTA. Below are your enrollment details:</p>
             <table>
             <tr>
                 <td><strong>Tracking Number:</strong></td>
@@ -159,7 +158,7 @@ const markStatusApproved = async (req, res) => {
             </tr>
             <tr>
                 <td><strong>Date of Expiry:</strong></td>
-                <td>2022-12-31</td>
+                <td>${validUntil}</td>
             </tr>
             <tr>
                 <td><strong>Name:</strong></td>
@@ -169,22 +168,52 @@ const markStatusApproved = async (req, res) => {
             <p>Please find your Coach License attached below.</p>
             <p>For any future correspondence, please use this email and the mobile number provided during registration.</p>
             <p><strong>Email:</strong> ${coachData.email}</p>
-            <p><strong>Mobile:</strong> ${coachData.mobile}</p>
-            <p>Thank you for registering with JKTC.</p>
-            <p>Best regards,<br>JKTC Team</p>`,
-            `${coachData.regNo}-identity-card.pdf`,
-            `./${coachData.regNo}-identity-card.pdf`
-        );
-
-        await deleteFiles(coachData.regNo);
-
-        if (!coach) {
-            return res.status(404).json({ message: "Coach not found" });
+            <p><strong>Mobile:</strong> ${coachData.mob}</p>
+            <p>Thank you for registering with JKTA.</p>
+            <p>Best regards,<br>JKTA Team</p>`,
+                `${coachData.regNo}-identity-card.pdf`,
+                `./${coachData.regNo}-identity-card.pdf`
+            );
+        } catch (licenceError) {
+            console.error(
+                "Licence card generation/delivery failed:",
+                licenceError && licenceError.message
+            );
+            licenceEmailResult = {
+                sent: false,
+                error: licenceError && licenceError.message
+                    ? licenceError.message
+                    : "Licence card generation failed",
+            };
+        } finally {
+            try {
+                await deleteFiles(coachData.regNo);
+            } catch (_) {
+                /* ignore cleanup errors */
+            }
         }
 
-        res.status(200).json({
-            message: "Coach approved successfully.",
+        await Coach.findByIdAndUpdate(coachData._id, {
+            $set: {
+                enrollmentNumber: CoachEnrollmentDetails.enrollmentNumber,
+                licenceEmailStatus: licenceEmailResult.sent ? "sent" : "failed",
+                licenceEmailMessageId: licenceEmailResult.messageId || null,
+                licenceEmailError: licenceEmailResult.sent
+                    ? null
+                    : licenceEmailResult.error || "Unknown error",
+                licenceEmailAttempts: (coachData.licenceEmailAttempts || 0) + 1,
+                licenceEmailLastAttemptAt: new Date(),
+                ...(licenceEmailResult.sent ? { licenceIssuedAt: new Date() } : {}),
+                licenceProcessingAt: null,
+            },
+        });
+
+        return res.status(200).json({
+            message: licenceEmailResult.sent
+                ? "Coach approved successfully. Licence card emailed."
+                : "Coach approved, but the licence card email failed. The failure was recorded and can be retried.",
             coach,
+            licenceEmailSent: licenceEmailResult.sent,
         });
     } catch (error) {
         res.status(500).json({ message: "Internal server error" });

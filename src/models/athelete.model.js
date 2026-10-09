@@ -32,6 +32,21 @@ const atheleteSchema = new Schema(
             type: Boolean,
             default: false,
         },
+        // ---- Licence card delivery tracking (shared with the public backend) ----
+        enrollmentNumber: String,
+        licenceEmailStatus: {
+            type: String,
+            enum: ["pending", "sent", "failed"],
+        },
+        licenceEmailMessageId: String,
+        licenceEmailError: String,
+        licenceEmailAttempts: {
+            type: Number,
+            default: 0,
+        },
+        licenceEmailLastAttemptAt: Date,
+        licenceIssuedAt: Date,
+        licenceProcessingAt: Date,
     },
     {
         timestamps: true,

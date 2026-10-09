@@ -2,32 +2,63 @@ import nodemailer from "nodemailer";
 import dotenv from "dotenv";
 
 dotenv.config();
-const FROM = process.env.SMTP_EMAIL_FROM;
 
-const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    secure: false, // Use true for SSL
-    auth: {
-        user: process.env.SMTP_EMAIL,
-        pass: process.env.SMTP_PASSWORD,
-    },
-});
+/**
+ * `secure` must match the port:
+ *   465 => implicit TLS (true), 587/25 => STARTTLS (false).
+ * SMTP_SECURE can override explicitly.
+ */
+const resolveSmtpConfig = () => {
+    const port = parseInt(process.env.SMTP_PORT, 10) || 587;
+    const secure =
+        process.env.SMTP_SECURE !== undefined && process.env.SMTP_SECURE !== ""
+            ? process.env.SMTP_SECURE === "true"
+            : port === 465;
 
-const sendMail = (to, subject, text, html, attachments, from = FROM) => {
+    return {
+        host: process.env.SMTP_HOST,
+        port,
+        secure,
+        auth: {
+            user: process.env.SMTP_EMAIL,
+            pass: process.env.SMTP_PASSWORD,
+        },
+    };
+};
+
+const senderAddress = () =>
+    process.env.SMTP_EMAIL_FROM || process.env.SMTP_EMAIL;
+
+let cachedTransporter = null;
+const getTransporter = () => {
+    if (!cachedTransporter) {
+        cachedTransporter = nodemailer.createTransport(resolveSmtpConfig());
+    }
+    return cachedTransporter;
+};
+
+const sanitizeError = (error) => {
+    if (!error) return "Unknown error";
+    const parts = [error.code, error.command, error.responseCode, error.message]
+        .filter(Boolean)
+        .map(String);
+    return parts.join(" | ") || "Unknown error";
+};
+
+const sendMail = (to, subject, text, html, attachments, from = senderAddress()) => {
     const mailOptions = {
         from,
         to,
         subject,
         text,
         html,
-        attachments, // Add attachments here
+        attachments,
     };
 
     return new Promise((resolve, reject) => {
-        transporter.sendMail(mailOptions, (error, info) => {
+        getTransporter().sendMail(mailOptions, (error, info) => {
             if (error) {
-                console.error("Error sending email:", error);
+                console.error("Error sending email:", sanitizeError(error));
                 reject(error);
             } else {
                 console.log("Message sent:", info.messageId);
@@ -37,20 +68,26 @@ const sendMail = (to, subject, text, html, attachments, from = FROM) => {
     });
 };
 
-const sendWithAttachment = async (to, subject, text, html, filename, path) => {
+/**
+ * Returns `{ sent, messageId, error }` instead of swallowing failures, so the
+ * caller can persist delivery status and offer a safe retry.
+ */
+const sendWithAttachment = async (to, subject, text, html, filename, filePath) => {
     try {
-        const attachment = [
-            {
-                filename: filename,
-                path: path,
-            },
-        ];
+        // Without a recipient, or without both attachment fields, send a plain
+        // email (matches the previous optional-attachment behaviour).
+        const attachments =
+            filename && filePath
+                ? [{ filename, path: filePath }]
+                : undefined;
 
-        await sendMail(to, subject, text, html, attachment);
+        const info = await sendMail(to, subject, text, html, attachments);
         console.log("Email sent successfully with attachment!");
+        return { sent: true, messageId: info.messageId || null, error: null };
     } catch (error) {
-        console.error("Failed to send email with attachment:", error);
+        console.error("Failed to send email with attachment:", sanitizeError(error));
+        return { sent: false, messageId: null, error: sanitizeError(error) };
     }
 };
 
-export { sendMail, sendWithAttachment };
+export { sendMail, sendWithAttachment, resolveSmtpConfig };

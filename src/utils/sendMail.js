@@ -3,12 +3,21 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const FROM = process.env.SMTP_EMAIL_FROM;
+// `secure` must match the port: 465 => true (implicit TLS),
+// 587/25 => false (STARTTLS). SMTP_SECURE can override explicitly.
+const smtpPort = parseInt(process.env.SMTP_PORT, 10) || 587;
+const smtpSecure =
+    process.env.SMTP_SECURE !== undefined && process.env.SMTP_SECURE !== ""
+        ? process.env.SMTP_SECURE === "true"
+        : smtpPort === 465;
+
+// Falls back to the authenticated mailbox so a valid sender is always set.
+const FROM = process.env.SMTP_EMAIL_FROM || process.env.SMTP_EMAIL;
 
 const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    secure: false, // Use true for SSL
+    port: smtpPort,
+    secure: smtpSecure,
     auth: {
         user: process.env.SMTP_EMAIL,
         pass: process.env.SMTP_PASSWORD,
